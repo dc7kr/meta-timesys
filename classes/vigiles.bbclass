@@ -43,7 +43,7 @@ def _get_patched(src_patches):
         found_cves = list()
 
         # Check patch file name for CVE ID
-        fname_match = cve_file_name_match.search(patch_file)
+        fname_match = cve_file_name_match.search(patch_base)
         if fname_match:
             cve = fname_match.group(1).upper()
             found_cves.append(cve)
@@ -282,11 +282,11 @@ addtask vigiles_patchmeta after do_patch before do_compile
 
 SSTATETASKS += "do_vigiles_patchmeta"
 
-do_vigiles_patchmeta[dirs] = "${VIGILES_PATCHMETA_DIR} ${VIGILES_PATCHMETA_DEPLOY}"
+do_vigiles_patchmeta[dirs] = "${VIGILES_PATCHMETA_DIR}"
 do_vigiles_patchmeta[vardeps] += "SRC_URI"
 do_vigiles_patchmeta[sstate-inputdirs] = "${VIGILES_PATCHMETA_DIR}"
 do_vigiles_patchmeta[sstate-outputdirs] = "${VIGILES_PATCHMETA_DEPLOY}"
-do_vigiles_patchmeta[cleandirs] = "${VIGILES_PATCHMETA_DEPLOY}"
+do_vigiles_patchmeta[cleandirs] = "${VIGILES_PATCHMETA_DIR}"
 
 python do_vigiles_patchmeta_setscene () {
     sstate_setscene(d)
@@ -333,11 +333,13 @@ python () {
 
 
 def update_vuln_info(d, cve, cve_status={}, pkg_name=None, pkg_version=None, source="Recipe", patches=None, external=False):
-    from tsmeta.util import get_vuln_status, get_vuln_justification, get_vuln_description
-    
+    from tsmeta.util import get_vuln_status, get_vuln_justification, get_vuln_description, get_yocto_status_detail
+
     vuln_data = {"id": cve}
     if not external:
         vuln_data = tsmeta_read_dictname(d, "vulnerabilities", cve) or vuln_data
+
+    vuln_data.setdefault("properties", [])
 
     # Add CVE_status
     vuln_data["analysis"] = {
@@ -346,13 +348,41 @@ def update_vuln_info(d, cve, cve_status={}, pkg_name=None, pkg_version=None, sou
         "detail": get_vuln_description(cve_status)
     }
 
+    yocto_status_detail = get_yocto_status_detail(cve_status)
+
+    # Add yocto_status_detail
+    if yocto_status_detail and source == "Recipe":
+        vuln_data["properties"] = [
+            prop for prop in vuln_data["properties"]
+            if prop.get("name") != "yocto_status_detail"
+        ]
+        vuln_data["properties"].append({
+            "name": "yocto_status_detail",
+            "value": yocto_status_detail
+        })
+
+    # Add patch information
+    if patches:
+        vuln_data["analysis"]["state"] = "resolved_with_pedigree"
+        vuln_data["properties"] = [
+            prop for prop in vuln_data["properties"]
+            if not (
+                prop.get("name") == "patches"
+                and prop.get("value") == ", ".join(patches)  # Avoid duplicate patch info if already exists
+            )
+        ]
+        vuln_data["properties"].append({
+            "name": "patches",
+            "value": ", ".join(patches)
+        })
+
     # Add Source
     vuln_data["source"] = dict(name=source)
 
     # Add affected products
     if pkg_name:
         status = (
-            "unaffected" 
+            "unaffected"
             if vuln_data["analysis"]["state"] in ["not_affected", "false_positive"]
             else "affected"
         )
@@ -360,32 +390,30 @@ def update_vuln_info(d, cve, cve_status={}, pkg_name=None, pkg_version=None, sou
             "status": status,
             "version": pkg_version
         }
-        if vuln_data.get("affects"):
-            products = [pd.get("product") for pd in vuln_data["affects"]]
-            if pkg_name and pkg_name not in products:
-                vuln_data["affects"].append({
-                        "product": pkg_name,
-                        "versions": [version]
-                    })
-            for product_dict in vuln_data["affects"]:
-                if product_dict.get("product") == pkg_name:
-                    if version in product_dict["versions"]:
-                        continue
-                    else:
-                        product_dict["versions"].append(version)
-        else:
-            vuln_data["affects"] = [{
-                "product": pkg_name,
-                "versions": [version]
-            }]
+        affects = vuln_data.get("affects")
+        if not isinstance(affects, list):
+            affects = []
+            vuln_data["affects"] = affects
 
-    # Add patch information
-    if patches:
-        vuln_data["properties"] = {
-            "name": "patches",
-            "value": ", ".join(patches)
-        }
-    
+        product_dict = next(
+            (pd for pd in affects if pd.get("product") == pkg_name),
+            None
+        )
+        if product_dict is None:
+            product_dict = {
+                "product": pkg_name,
+                "versions": []
+            }
+            affects.append(product_dict)
+
+        versions = product_dict.get("versions")
+        if not isinstance(versions, list):
+            versions = []
+            product_dict["versions"] = versions
+
+        if version not in versions:
+            versions.append(version)
+
     if not external:
         tsmeta_write_dictname(d, "vulnerabilities", cve, vuln_data)
     return vuln_data
@@ -393,6 +421,11 @@ def update_vuln_info(d, cve, cve_status={}, pkg_name=None, pkg_version=None, sou
 
 def vigiles_collect_vulnerability_info(d, pkg_name, pkg_version, patched_cves=None):
     from oe.cve_check import decode_cve_status
+
+    try:
+        from oe.cve_check import has_cve_product_match
+    except ImportError:
+        has_cve_product_match = None
 
     # cves declared using CVE_STATUS var
     for cve in (d.getVarFlags("CVE_STATUS") or {}):
@@ -404,6 +437,12 @@ def vigiles_collect_vulnerability_info(d, pkg_name, pkg_version, patched_cves=No
             cve_status["detail"] = status_info[1]
             cve_status["description"] = status_info[2]
         elif isinstance(status_info, dict):     # styhead and later
+            if (
+                has_cve_product_match
+                and not has_cve_product_match(status_info, d.getVar("CVE_PRODUCT") or "")
+            ):
+                continue
+
             cve_status["decoded_status"] = status_info.get("mapping")
             cve_status["detail"] = status_info.get("detail")
             cve_status["description"] = status_info.get("description")
@@ -477,15 +516,12 @@ def vigiles_collect_pkg_info(d):
         manifest['download_location'] = "UNKNOWN"
 
     sources = manifest.pop('sources')
-    patch_metafile = os.path.join(d.getVar("VIGILES_PATCHMETA_DIR"), "vigiles-patches.json")
-    patches = []
-    patched_dict = {}
-
-    if os.path.exists(patch_metafile):
-        with open(patch_metafile, "r") as f:
-            patch_meta = json.load(f)
-            patches = list(patch_meta.get("src_patches", {}).keys())
-            patched_dict = patch_meta.get("patched_cves", {})
+    patch_meta = tsmeta_get_vigiles_patchmeta(d)
+    src_patches = patch_meta.get("src_patches", {})
+    patches = list(src_patches.keys())
+    patched_dict = patch_meta.get("patched_cves", {})
+    if patches and patch_meta.get("_vigiles_patchmeta_fallback"):
+        patched_dict = _get_patched(src_patches)
 
     vigiles_collect_vulnerability_info(
         d,
@@ -574,8 +610,7 @@ def vigiles_write_manifest(d, tdw_tag, dict_out):
 
     f_path = _get_vout_path(v_imgdir, _name, m_max_len, v_tstamp, d.getVar('VIGILES_MANIFEST_SUFFIX'))
     with open(f_path, "w") as f_out:
-        s = json.dumps(dict_out, indent=2, sort_keys=True)
-        f_out.write(s)
+        json.dump(dict_out, f_out, sort_keys=True, separators=(",", ":"))
 
     l_path = _get_vlink(v_dir, _name, m_max_len, d.getVar('VIGILES_MANIFEST_SUFFIX'))
 
@@ -789,11 +824,11 @@ def _get_vulnerabilities(d, pn_list):
     from tsmeta.util import validate_vuln_id
 
     vulnerabilities = []
+    pn_set = set(pn_list)
     cve_dict_base = tsmeta_read_dictdir(d, "vulnerabilities")
-    for cve, cve_dict in cve_dict_base.items():
-        for prod_dict in cve_dict.get("affects", {}):
-            if prod_dict.get("product") in pn_list:
-                vulnerabilities.append(cve_dict)
+    for cve_dict in cve_dict_base.values():
+        if any(prod_dict.get("product") in pn_set for prod_dict in cve_dict.get("affects", [])):
+            vulnerabilities.append(cve_dict)
 
     # Add cves from global whitelist
     external_whitelists = set(
@@ -861,9 +896,8 @@ def _get_vulnerabilities(d, pn_list):
 def vigiles_image_collect(d):
     from datetime import datetime, timezone
 
-    def get_dep_pns(pn, deps, tsmeta_dir):
+    def get_dep_pns(pn, deps, dep_reference):
         dep_pns = set()
-        dep_reference = tsmeta_read_dictdir(d, tsmeta_dir)
         for dep in deps:
             dep_pn = dep_reference.get(dep, {}).get("pn", "")
             if dep_pn and dep_pn != pn:
@@ -892,6 +926,8 @@ def vigiles_image_collect(d):
         parsed_keys = set()
         build_deps = set()
         runtime_deps = set()
+        build_dep_ref = tsmeta_read_dictdir(d, "build_deps")
+        runtime_dep_ref = tsmeta_read_dictdir(d, "runtime_deps")
 
         while queue:
             key = queue.popleft()
@@ -900,8 +936,8 @@ def vigiles_image_collect(d):
 
             parsed_keys.add(key)
 
-            bdep_dict = tsmeta_read_dictname(d, "build_deps", key)
-            rdep_dict = tsmeta_read_dictname(d, "runtime_deps", key)
+            bdep_dict = build_dep_ref.get(key, {})
+            rdep_dict = runtime_dep_ref.get(key, {})
 
             bdeps = get_pkgs(bdep_dict)
             rdeps = get_pkgs(rdep_dict)
@@ -909,13 +945,15 @@ def vigiles_image_collect(d):
             key_pn = bdep_dict.get("pn", rdep_dict.get("pn")) or key
 
             # Collect PN's of the package to avoid multiple packages with same cve_product
-            bdep_pns = get_dep_pns(key_pn, bdeps, "build_deps")
-            rdep_pns = get_dep_pns(key_pn, rdeps, "runtime_deps")
+            bdep_pns = get_dep_pns(key_pn, bdeps, build_dep_ref)
+            rdep_pns = get_dep_pns(key_pn, rdeps, runtime_dep_ref)
 
             deps[key_pn]["build"].update(bdep_pns)
             deps[key_pn]["runtime"].update(rdep_pns)
 
-            queue.extend(bdeps + rdeps)
+            for dep in bdeps + rdeps:
+                if dep not in parsed_keys:
+                    queue.append(dep)
 
             build_deps.update(bdep_pns)
             runtime_deps.update(rdep_pns)
@@ -1018,8 +1056,7 @@ def vigiles_image_collect(d):
             machine          = sys_dict["machine"]["title"],
             manifest_version = d.getVar('VIGILES_MANIFEST_VERSION'),
             manifest_name    = _name,
-            packages         = _get_packages(d, pn_list),
-            vulnerabilities   = _get_vulnerabilities(d, pn_list)
+            packages         = _get_packages(d, pn_list)
         )
     dict_out.update(_get_extra_packages(d))
     _filter_excluded_packages(d, dict_out['packages'])
@@ -1027,6 +1064,10 @@ def vigiles_image_collect(d):
     add_dependencies(dict_out)
     # Add default package fields
     dict_out = set_package_field_defaults(dict_out)
+    dict_out["vulnerabilities"] = _get_vulnerabilities(
+        d,
+        dict_out["packages"].keys()
+    )
 
     return dict_out
 
@@ -1343,6 +1384,8 @@ def _get_export_details(d, vigiles_out):
         cyclonedx_version = d.getVar('VIGILES_CYCLONEDX_VERSION')
         if cyclonedx_version:
             export_args += ['--cyclonedx-version', cyclonedx_version.strip().lower()]
+    elif file_format == "spdx_3-sbom-vex":
+        file_format = "json"
     elif file_format == "pdfsummary":
         file_format = file_format[:3]
 
@@ -1376,6 +1419,15 @@ python do_vigiles_check() {
                                    '.'.join([_get_kernel_pf(d), 'config']))
     vigiles_uconfig = os.path.join(d.getVar('VIGILES_DIR'),
                                    '.'.join([_get_uboot_pf(d), 'config']))
+    queue_jobs = bb.utils.to_boolean(d.getVar('VIGILES_QUEUE_JOBS'), False)
+    export_format = d.getVar('VIGILES_EXPORT_FORMAT')
+    if queue_jobs and export_format:
+        log_vigiles_response(
+            d,
+            "ERROR",
+            "Vigiles: 'VIGILES_QUEUE_JOBS' and 'VIGILES_EXPORT_FORMAT' cannot be used together."
+        )
+        return
 
     bb.utils.export_proxies(d)
 
@@ -1401,6 +1453,11 @@ python do_vigiles_check() {
         if subscribe:
             bb.debug(1, "Setting SBOM report notification frequency to: %s" % subscribe)
             args = args + ['-s', subscribe]
+        
+        sbom_token_path = d.getVar('VIGILES_DOWNLOAD_SBOM_TOKEN_PATH')
+        if sbom_token_path and not queue_jobs:
+            bb.debug(1, "SBOM token will be saved to : %s" % sbom_token_path)
+            args = args + ['--sbom-token-path', sbom_token_path]
 
         vigiles_env = os.environ.copy()
 
@@ -1434,6 +1491,13 @@ python do_vigiles_check() {
         if _upload_only:
             args = args + ['-U']
 
+        if queue_jobs:
+            args = args + ['--queue-jobs']
+
+        job_timeout = d.getVar('VIGILES_JOB_TIMEOUT_SECONDS')
+        if job_timeout:
+            args = args + ['--timeout', job_timeout]
+
         # Vigiles uses python3, and needs to use the Host-installed instance
         # to avoid racing against the removal of the Yocto-built native
         # instance when 'INHERIT += rm_work' is used.
@@ -1462,14 +1526,14 @@ python do_vigiles_check() {
 
     vigiles_export_args, vigiles_export_report_path, file_format = _get_export_details(d, vigiles_out)
     try:
-        check_out, _ = run_checkcves(d, "checkcves.py", 
-            [ '-m', vigiles_in, '-o', vigiles_out ] + vigiles_export_args)
+        check_args = [ '-m', vigiles_in, '-o', vigiles_out ] + vigiles_export_args
+        check_out, _ = run_checkcves(d, "checkcves.py", check_args)
 
         log_vigiles_response(d, response=check_out)
 
-        if os.path.lexists(vigiles_link):
-            os.remove(vigiles_link)
         if os.path.exists(vigiles_out):
+            if os.path.lexists(vigiles_link):
+                os.remove(vigiles_link)
             os.symlink(os.path.relpath(vigiles_out, os.path.dirname(vigiles_link)), vigiles_link)
         if os.path.exists(vigiles_export_report_path):
             export_vlink = _get_vlink(v_dir, _name, m_max_len, d.getVar('VIGILES_REPORT_SUFFIX').replace('.txt', '')) + '.' + file_format
@@ -1488,3 +1552,168 @@ addtask do_vigiles_check after do_image before do_image_complete
 do_vigiles_check[nostamp] = "1"
 do_vigiles_check[vardepsexclude] = "BB_ORIGENV"
 do_vigiles_check[network] = "1"
+
+def _validate_sbom_download_args(d):
+    from tsmeta.constants import DOWNLOAD_SBOM_OPTIONS
+
+    sbom_type = (d.getVar("VIGILES_DOWNLOAD_SBOM_SPEC") or "").lower()
+    sbom_format = (d.getVar("VIGILES_DOWNLOAD_SBOM_FORMAT") or "").lower()
+    sbom_version = (d.getVar("VIGILES_DOWNLOAD_SBOM_VERSION") or "").strip()
+
+    valid_types = list(DOWNLOAD_SBOM_OPTIONS)
+
+    if sbom_type not in valid_types:
+        raise ValueError(
+            "Invalid sbom specification '%s' selected. Choose from %s" % (
+                sbom_type,
+                valid_types
+            ))
+
+    download_options = DOWNLOAD_SBOM_OPTIONS[sbom_type]
+    valid_versions = tuple(download_options.keys())
+    if sbom_version not in valid_versions:
+        raise ValueError(
+            "Invalid sbom version '%s' for '%s'. Choose from %s" % (
+                sbom_version,
+                sbom_type,
+                valid_versions
+            ))
+
+    valid_formats = download_options[sbom_version]
+    if sbom_format not in valid_formats:
+        raise ValueError(
+            "Invalid file format '%s' for '%s' version '%s'. Choose from %s" % (
+                sbom_format,
+                sbom_type,
+                sbom_version,
+                valid_formats
+            ))
+
+
+python do_vigiles_download_sbom() {
+    import os
+    import datetime
+
+    if bb.utils.to_boolean(d.getVar("VIGILES_QUEUE_JOBS"), False):
+        bb.warn("Vigiles: SBOM download skipped because VIGILES_QUEUE_JOBS is enabled")
+        return
+
+    token_path = d.getVar("VIGILES_DOWNLOAD_SBOM_TOKEN_PATH")
+    if not os.path.exists(token_path):
+        log_vigiles_response(d, "ERROR", "Vigiles: SBOM token file not found: %s" % token_path)
+        return
+
+    try:
+        with open(token_path, "r") as f:
+            token = f.read().strip()
+    except IOError as e:
+        log_vigiles_response(d, "ERROR", "Vigiles: Failed to read token file %s: %s" % (token_path, str(e)))
+        return
+
+    if not token:
+        log_vigiles_response(d, "ERROR", "Vigiles: SBOM token file is empty: %s" % token_path)
+        return
+
+    keyfile = d.getVar("VIGILES_KEY_FILE")
+    if not os.path.exists(keyfile):
+        log_vigiles_response(d, "ERROR", "Vigiles: API key not found")
+        return
+
+    vigiles_bin = d.getVar("VIGILES_BIN_PATH")
+    if not vigiles_bin:
+        vigiles_bin = os.path.join(d.getVar("STAGING_BINDIR_NATIVE"), "vigiles")
+
+    if not os.path.exists(vigiles_bin):
+        log_vigiles_response(d, "ERROR", "Vigiles: vigiles binary not found at %s" % vigiles_bin)
+        return
+    
+    bb.plain("Vigiles: Using vigiles binary at %s" % vigiles_bin)
+
+    img_dir = d.getVar("VIGILES_DOWNLOAD_SBOM_DEPLOY_DIR")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+
+    sbom_type = (d.getVar("VIGILES_DOWNLOAD_SBOM_SPEC") or "").lower()
+    sbom_version = (d.getVar("VIGILES_DOWNLOAD_SBOM_VERSION") or "").strip()
+
+    if sbom_type and not sbom_version:
+        if sbom_type == "cyclonedx":
+            d.setVar("VIGILES_DOWNLOAD_SBOM_VERSION", d.getVar("VIGILES_DEFAULT_CYCLONEDX_VERSION"))
+        else:
+            d.setVar("VIGILES_DOWNLOAD_SBOM_VERSION", d.getVar("VIGILES_DEFAULT_SPDX_VERSION"))
+
+        sbom_version = (d.getVar("VIGILES_DOWNLOAD_SBOM_VERSION") or "").strip()
+
+    sbom_format = (d.getVar("VIGILES_DOWNLOAD_SBOM_FORMAT") or "").lower()
+
+    try:
+        _validate_sbom_download_args(d)
+    except ValueError as err:
+        log_vigiles_response(d, "ERROR", "Vigiles: %s" % str(err))
+        return
+    
+    sbom_name = "%s-%s" % (d.getVar("VIGILES_MANIFEST_NAME"), d.getVar("MACHINE"))
+    if sbom_format == "tag":
+        output_extension = "spdx"
+    elif sbom_format == "json-ld":
+        output_extension = "json"
+    else:
+        output_extension = sbom_format
+
+    sbom_suffix = "-sbom.%s" % output_extension
+    sbom_max_len = int(d.getVar("VIGILES_MANIFEST_NAME_MAX_LENGTH"))
+
+    output_path = _get_vout_path(img_dir, sbom_name, sbom_max_len, timestamp, sbom_suffix)
+    link_path = _get_vlink(img_dir, sbom_name, sbom_max_len, sbom_suffix)
+
+    cmd = [
+        vigiles_bin,
+        "-k", keyfile,
+        "manifest", "download", token,
+        "-f", sbom_type,
+        "-i", sbom_format,
+        "-v", sbom_version,
+        "-o", output_path
+    ]
+
+    bb.plain("Vigiles: Downloading %s-%s SBOM" % (sbom_type, sbom_version))
+
+    try:
+        stdout, stderr = bb.process.run(cmd)
+        log_vigiles_response(d, response=stdout)
+    except Exception as err:
+        log_vigiles_response(d, "ERROR", "Vigiles: SBOM download failed:\n", str(err))
+        return
+
+    if stderr:
+        log_vigiles_response(d, "WARNING", "Vigiles: %s" % stderr)
+        
+    if os.path.exists(output_path):
+        if os.path.lexists(link_path):
+            os.remove(link_path)
+
+        os.symlink(os.path.relpath(output_path, os.path.dirname(link_path)), link_path)
+        bb.debug(1, "Vigiles: Created symlink: %s -> %s" % (link_path, output_path))
+        bb.plain("Vigiles: Successfully downloaded SBOM to %s" % link_path)
+    else:
+        log_vigiles_response(d, "ERROR", "Vigiles: Failed to download SBOM")
+        return
+}
+
+do_vigiles_download_sbom[network] = "1"
+
+python () {
+    import os
+    
+    if not bb.utils.to_boolean(d.getVar("VIGILES_ENABLE_DOWNLOAD_SBOM")):
+        return
+
+    if not bb.data.inherits_class('image', d):
+        return
+    
+    bb.build.addtask("do_vigiles_download_sbom", "do_image_complete", "do_vigiles_check", d)
+             
+    vigiles_bin = d.getVar("VIGILES_BIN_PATH")
+    if not os.path.exists(vigiles_bin):
+        bb.debug(1, "Vigiles: User defined vigiles binary not found, vigiles-cli will be installed.")
+        d.appendVarFlag("do_vigiles_download_sbom", "depends", " vigiles-cli-native:do_populate_sysroot")      
+}

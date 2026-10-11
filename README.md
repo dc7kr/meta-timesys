@@ -461,8 +461,7 @@ VIGILES_UPLOAD_ONLY = "1"
 
 Instead of a text report and a link to the online report, a link to the
 Vigiles Dashboard (as specified with VIGILES_DASHBOARD_CONFIG) or Private Workspace
-(if no dashboard config is specified)
-will be displayed, from where it can be then be
+(if no dashboard config is specified) will be displayed, from where it can then be
 scanned by the Vigiles Service.
 
 
@@ -610,6 +609,7 @@ To export the report set `VIGILES_EXPORT_FORMAT` to any of the below choices in 
 - csv
 - cyclonedx-vex
 - cyclonedx-sbom-vex
+- spdx_3-sbom-vex
 
 ```
 VIGILES_EXPORT_FORMAT = "pdf"
@@ -621,6 +621,7 @@ If you choose to export the report in cyclonedx format, you need to specify addi
 - xml
 
 `VIGILES_CYCLONEDX_VERSION`
+- 1.7
 - 1.6 [default]
 - 1.5
 - 1.4
@@ -631,16 +632,85 @@ VIGILES_CYCLONEDX_FORMAT = "xml"
 VIGILES_CYCLONEDX_VERSION = "1.5"
 ```
 
+### Downloading converted SBOMs
+
+This option allows SBOMs generated in vigiles format to be converted into standard SPDX or CycloneDX formats. When enabled, the converted SBOM is downloaded to `build/tmp/deploy/images/<machine>/`.
+
+#### Enabling SBOM Download
+To enable SBOM conversion and download, add the following to local.conf
+```
+VIGILES_ENABLE_DOWNLOAD_SBOM = "1"
+```
+
+If enabled, it will download a CycloneDX 1.6 json format SBOM. To specify the spec, format and version of the SBOM, refer below:
+
+#### Specifying path to vigiles binary
+If `VIGILES_BIN_PATH` variable is set, meta-timesys uses the specified binary to communicate with the Vigiles server and download the SBOM.
+If it is not set, meta-timesys automatically installs [vigiles-cli](https://github.com/TimesysGit/vigiles-cli) into the native sysroot using the vigiles-cli-native recipe and uses it for SBOM downloads by default.
+
+**Note:** Using the latest version of vigiles-cli is recommended. However, if you need to use an older version, ensure it is v1.0.3 or higher.
+
+Path can be specified as below in local.conf
+
+```
+VIGILES_BIN_PATH = "/usr/local/bin/vigiles"
+```
+
+#### Selecting SBOM Download Options
+Use `VIGILES_DOWNLOAD_SBOM_SPEC` to select the target SBOM specification:
+* `cyclonedx` [default], `spdx`, and `spdx-lite`
+
+Use `VIGILES_DOWNLOAD_SBOM_VERSION` and `VIGILES_DOWNLOAD_SBOM_FORMAT` to specify the output version and file format.
+
+Supported options are:
+
+* SBOM versions for `cyclonedx`: `1.7`, `1.6` [default], `1.5`, `1.4`, `1.3`, `1.2`, and `1.1`
+* SBOM file types for `cyclonedx`: `json` [default] and `xml`
+* SBOM versions for `spdx` and `spdx-lite`: `3.0.1`, `2.3`, and `2.2`
+* SBOM file types for `spdx` and `spdx-lite`:
+  * `3.0.1`: `json-ld`
+  * `2.3` and `2.2`: `tag`, `json`, `xlsx`, `xls`, `rdfxml`, `yaml`, `xml`
+
+For example, to download an SPDX 2.3 SBOM in tag format:
+```
+VIGILES_DOWNLOAD_SBOM_SPEC = "spdx"
+VIGILES_DOWNLOAD_SBOM_VERSION = "2.3"
+VIGILES_DOWNLOAD_SBOM_FORMAT = "tag"
+```
+
+
+### Queue SBOM Upload and Report Generation
+
+The Vigiles server supports asynchronous SBOM uploads and vulnerability report generation. To submit the
+SBOM upload and report-generation jobs without waiting for them to finish, use the
+following option:
+
+```
+VIGILES_QUEUE_JOBS = '1'
+```
+
+Vigiles prints a message confirming that the jobs were submitted and does not wait for them to finish. No report is generated locally.
+
+
+### Background Job Timeout
+
+When **Queue SBOM Upload and Report Generation** is disabled, Vigiles waits for the
+asynchronous SBOM-upload or report-generation job to finish. To configure the maximum wait time, set:
+
+```
+VIGILES_JOB_TIMEOUT_SECONDS = '600'
+```
+
+The default wait time is 10 minutes. This timeout does not apply when **Queue SBOM
+Upload and Report Generation** is enabled because Vigiles exits immediately after the jobs are submitted.
+
+
 Maintenance
 ===========
 
 The Vigiles CVE Scanner and meta-timesys are maintained by [The Lynx Security team](mailto:vigiles@timesys.com).
 
 For Updates, Support and More Information, please see:
-
 [Vigiles Website](https://www.lynx.com/solutions/vulnerability-mitigation-management)
-
 and
-
 [meta-timesys @ GitHub](https://github.com/TimesysGit/meta-timesys)
-

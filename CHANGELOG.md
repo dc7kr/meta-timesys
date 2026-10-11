@@ -1,5 +1,64 @@
 # Changelog
 
+## [v2.37.0] - 2026-10-05
+
+### Added
+
+* [feature] Add support for async SBOM upload and report generation
+
+## [v2.36.1] - 2026-07-28
+
+### Fixed
+
+* Fixed duplicate vulnerability entries 
+* [tsmeta] Restore patches when patchmeta is unavailable
+
+## [v2.36.0] - 2026-06-30
+
+### Added
+
+* [feature] Add support for SPDX 3.0.1
+
+## [v2.35.0] - 2026-06-15
+
+### Added
+
+* [feature] Add yocto cve status detail in vigiles sboms
+* [feature] Add support for CycloneDX 1.7
+
+### Fixed
+
+* [lib/tsmeta/utils.py] Update Vigiles status mappings
+
+## [v2.34.0] - 2026-03-17
+
+### Added
+
+* [layer] Make layer compatible with Wrynose(6.0) release
+
+### Fixed
+
+* [vigiles.bbclass] Fix: Patches are incorrectly added to patched cves
+* [vigiles-patchmeta] Fix: Patches not included when rebuilding after rm_work
+
+## [v2.33.1] - 2026-03-17
+
+### Fixed
+
+* [misc.] add .gitignore to repo root
+
+## [v2.33.0] - 2026-02-24
+
+### Added
+
+* [layer] Make layer compatible with Whinlatter(5.3) release
+* [feature] Add option to download converted SBOMs to deploy image dir
+
+### Fixed
+
+* [tsmeta.bbclass] Fix TypeError when Makefile doesnt exists for kernel
+* [tsmeta.bbclass] set BPN as fallback for cve_product
+
 ## [v2.32.0] - 2026-02-02
 
 ### Added

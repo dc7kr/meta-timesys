@@ -22,6 +22,7 @@ import gzip
 from io import BytesIO
 
 from lib import llapi
+from lib.jobs import DEFAULT_JOB_TIMEOUT, wait_for_job
 
 NVD_BASE_URL = 'https://nvd.nist.gov/vuln/detail/'
 API_DOC = 'https://vigiles.lynx.com/docs/vigiles_api_key_file.html'
@@ -92,6 +93,15 @@ def print_bad_keyfile_notice(keyfile):
 
 
 def handle_cmdline_args():
+    def positive_int(value):
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError('must be a positive integer')
+        if value < 1:
+            raise argparse.ArgumentTypeError('must be a positive integer')
+        return value
+
     parser = argparse.ArgumentParser(description=get_usage())
     parser.add_argument('-s', '--subscribe',
                         help='Set subscription frequency for sbom report notifications: "none", "daily", "weekly", "monthly"',
@@ -118,6 +128,11 @@ def handle_cmdline_args():
     parser.add_argument('-U', '--upload-only', dest='upload_only',
                         help='Upload the manifest only; do not wait for report.',
                         action='store_true', default=False)
+    parser.add_argument('--queue-jobs', dest='queue_jobs', action='store_true', default=False,
+                        help='Submit jobs and exit immediately without waiting for results.')
+    parser.add_argument('--timeout', dest='timeout', type=positive_int,
+                        default=DEFAULT_JOB_TIMEOUT, metavar='SECONDS',
+                        help='Maximum seconds to wait for a background job (default: %d)' % DEFAULT_JOB_TIMEOUT)
     parser.add_argument('-m', '--manifest', required=True,
                         help='Pre-generated JSON image manifest file to check',
                         metavar='FILE')
@@ -127,17 +142,25 @@ def handle_cmdline_args():
                             into the vulnerability report')
     parser.add_argument('--export-format', dest='export_format',
                         help='Filetype for the exported report', 
-                        choices=['pdf', 'pdfsummary', 'xlsx', 'csv', 'cyclonedx-vex', 'cyclonedx-sbom-vex'])
+                        choices=['pdf', 'pdfsummary', 'xlsx', 'csv', 'cyclonedx-vex', 'cyclonedx-sbom-vex', 'spdx_3-sbom-vex'])
     parser.add_argument('--cyclonedx-format', dest='cyclonedx_format', default='json',
                         help='CycloneDX file format to download report in VEX format',
                         choices=['json', 'xml'])
     parser.add_argument('--cyclonedx-version', dest='cyclonedx_version', default='1.6',
                         help='CycloneDX spec version to download report in VEX format',
-                        choices=['1.4', '1.5', '1.6'])
+                        choices=['1.4', '1.5', '1.6', '1.7'])
     parser.add_argument('--export-path', metavar="PATH",
                         help='Filepath for the exported report')
+    parser.add_argument('--sbom-token-path', metavar="PATH",
+                        help='Filepath to save SBOM token')
     
     args = parser.parse_args()
+
+    if args.queue_jobs and args.export_format:
+        parser.error('--queue-jobs and --export-format cannot be used together')
+
+    if args.queue_jobs and args.sbom_token_path:
+        parser.error('--queue-jobs and --sbom-token-path cannot be used together')
 
     if args.export_format and not args.export_path:
         parser.error("--export-path is required when --export-format is specified")
@@ -145,13 +168,16 @@ def handle_cmdline_args():
     if args.export_path and os.path.isdir(args.export_path):
         parser.error(f"Export path '{args.export_path}' is an existing directory, not a filepath")
 
+    if args.sbom_token_path and os.path.exists(args.sbom_token_path):
+        os.remove(args.sbom_token_path)
+
     return args
 
 
 def read_manifest(manifest_file):
     try:
         with open(manifest_file, 'r') as f:
-            manifest_data = ''.join(line.rstrip() for line in f)
+            manifest_data = f.read()
     except (OSError, IOError, UnicodeDecodeError) as e:
         error('Could not open manifest: %s' % e)
         sys.exit(1)
@@ -483,18 +509,13 @@ if __name__ == '__main__':
     is_enterprise = vgls_creds.get('is_enterprise')
     upload_only = args.upload_only
 
-    if args.outfile:
-        outfile = open(args.outfile, 'w')
-    else:
-        outfile = None
+    outfile = None
 
     manifest_data = read_manifest(args.manifest)
-    m = json.loads(manifest_data)
-    if len(m['packages']) == 0:
+    manifest = json.loads(manifest_data)
+    if len(manifest['packages']) == 0:
         error('No packages found in manifest.\n')
         sys.exit(1)
-
-    manifest = json.loads(manifest_data)
 
     # If -k is specified, the given config file is submitted along with the
     # manifest to filter out irrelevant kernel CVEs
@@ -527,6 +548,8 @@ if __name__ == '__main__':
       'folder_token': vgls_creds.get('folder', ''),
       'subfolder_name': vgls_creds.get('subfolder_name', ''),
       'upload_only': upload_only,
+      # Vigiles does not support exporting a report from an async upload.
+      'async': not args.export_format,
     }
 
     if kernel_config:
@@ -586,7 +609,56 @@ if __name__ == '__main__':
     result = llapi.api_post(email, key, resource, request)
 
     if not result:
-      sys.exit(1)
+        sys.exit(1)
+
+    job_id = result.get("job_id")
+
+    if job_id and not args.export_format:
+        if args.queue_jobs:
+            if upload_only:
+                print('Vigiles: SBOM upload job queued successfully.')
+            else:
+                print('Vigiles: SBOM upload and vulnerability report jobs queued successfully.')
+            sys.exit(0)
+
+        try:
+            job_result = wait_for_job(email, key, job_id, args.timeout)
+        except Exception as exc:
+            error(str(exc))
+            sys.exit(1)
+
+        if upload_only:
+            result = {
+                'manifest_token': job_result.get('manifest_token'),
+                'group_token': job_result.get('group_token'),
+                'folder_token': job_result.get('folder_token'),
+            }
+        else:
+            manifest_token = job_result.get("manifest_token")
+            if not manifest_token:
+                error('Completed Vigiles job did not return a manifest_token')
+                sys.exit(1)
+
+            result = llapi.api_get(
+                email, key,
+                "/api/v1/vigiles/manifests/%s/reports/latest" % manifest_token,
+                {'filtered': False},
+            )
+            if not result:
+                error('Vigiles did not return the completed report')
+                sys.exit(1)
+
+    if args.outfile:
+        outfile = open(args.outfile, 'w')
+
+    if args.sbom_token_path:
+        sbom_token = result.get("manifest_token")
+        if not sbom_token:
+            error("Manifest token missing from the API response")
+            sys.exit(1)
+
+        with open(args.sbom_token_path, "w") as token_file:
+            token_file.write(sbom_token)
 
     # the default list contains a harmless but bogus example CVE ID,
     # don't print it here in case that is confusing.
@@ -643,6 +715,8 @@ if __name__ == '__main__':
                 file_extension = file_extension[:3]
             elif file_extension.startswith('cyclonedx'):
                 file_extension = args.cyclonedx_format
+            elif file_extension == 'spdx_3-sbom-vex':
+                file_extension = 'json'
             
             root, _ = os.path.splitext(args.export_path)
             export_path = "%s.%s" % (root, file_extension)
